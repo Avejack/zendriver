@@ -115,56 +115,16 @@ class Transaction(asyncio.Future[Any]):
         :return:
         """
 
-        if self.done():
-            logger.debug("ignoring late response for completed transaction %s", self)
-            return
-
         if "error" in response:
             # set exception and bail out
-            self._set_exception_safely(ProtocolException(response["error"]))
-            return
-
-        if "result" not in response:
-            self._set_exception_safely(
-                ProtocolException("cdp response missing 'result':\n%s" % response)
-            )
-            return
+            return self.set_exception(ProtocolException(response["error"]))
         try:
             # try to parse the result according to the py cdp docs.
             self.__cdp_obj__.send(response["result"])
         except StopIteration as e:
             # exception value holds the parsed response
-            self._set_result_safely(e.value)
-            return
-        except Exception as e:
-            self._set_exception_safely(e)
-            return
-        self._set_exception_safely(
-            ProtocolException("could not parse the cdp response:\n%s" % response)
-        )
-
-    def _set_result_safely(self, result: Any) -> None:
-        try:
-            self.set_result(result)
-        except asyncio.InvalidStateError:
-            logger.debug(
-                "ignoring result for transaction in invalid state (id=%s, method=%s)",
-                self.id,
-                self.method,
-                exc_info=True,
-            )
-
-    def _set_exception_safely(self, exception: Exception) -> None:
-        try:
-            self.set_exception(exception)
-        except asyncio.InvalidStateError:
-            logger.debug(
-                "ignoring exception for transaction in invalid state (id=%s, method=%s): %s",
-                self.id,
-                self.method,
-                exception,
-                exc_info=True,
-            )
+            return self.set_result(e.value)
+        raise ProtocolException("could not parse the cdp response:\n%s" % response)
 
     def __repr__(self) -> str:
         success = False if (self.done() and self.has_exception) else True
@@ -610,13 +570,7 @@ class Connection(metaclass=CantTouchThis):
         await self.websocket.send(tx.message)
         try:
             return await tx  # type: ignore
-        except asyncio.CancelledError:
-            if tx.id is not None and self.mapper.get(tx.id) is tx:
-                self.mapper.pop(tx.id, None)
-            raise
         except ProtocolException as e:
-            if tx.id is not None and self.mapper.get(tx.id) is tx:
-                self.mapper.pop(tx.id, None)
             e.message = e.message or ""
             e.message += f"\ncommand:{tx.method}\nparams:{tx.params}"
             raise e
@@ -725,15 +679,8 @@ class Connection(metaclass=CantTouchThis):
         try:
             # in try except since if browser connection sends this it reises an exception
             return await tx
-        except asyncio.CancelledError:
-            if tx.id is not None and self.mapper.get(tx.id) is tx:
-                self.mapper.pop(tx.id, None)
-            raise
         except ProtocolException:
             pass
-        finally:
-            if tx.id is not None and self.mapper.get(tx.id) is tx:
-                self.mapper.pop(tx.id, None)
 
 
 class Listener:
@@ -783,22 +730,6 @@ class Listener:
             return False
         return True
 
-    def _complete_transaction(
-        self, tx: Transaction, message: dict[str, Any], message_id: int
-    ) -> None:
-        try:
-            tx(**message)
-        except Exception as e:
-            logger.warning(
-                "exception while completing transaction %s (message_id:%s): %s",
-                tx,
-                message_id,
-                e,
-                exc_info=True,
-            )
-            if not tx.done():
-                tx._set_exception_safely(e)
-
     async def listener_loop(self) -> None:
         while True:
             if self.connection.websocket is None:
@@ -846,13 +777,13 @@ class Listener:
 
                     # complete the transaction, which is a Future object
                     # and thus will return to anyone awaiting it.
-                    self._complete_transaction(tx, message, message["id"])
+                    tx(**message)
                 else:
                     if message["id"] == -2:
                         maybe_tx = self.connection.mapper.get(-2)
                         if maybe_tx:
                             tx = maybe_tx
-                            self._complete_transaction(tx, message, message["id"])
+                            tx(**message)
                         continue
             else:
                 # probably an event
